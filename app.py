@@ -1,21 +1,29 @@
-import re, ssl, random, warnings
-import streamlit as st
-import nltk, spacy
-from nltk.tokenize import word_tokenize
-from nltk.corpus import wordnet
+# api.py
+import re
+import ssl
+import random
+import warnings
+from typing import List, Optional
 
-# Optional MiniLM model
+import nltk
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# Optional: sentence-transformers to pick natural synonyms (safe fallback without it)
 try:
     from sentence_transformers import SentenceTransformer, util
     ST_OK = True
 except Exception:
-    SentenceTransformer = None
-    util = None
+    SentenceTransformer = None  # type: ignore
+    util = None  # type: ignore
     ST_OK = False
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ---------- Setup ----------
+# -----------------------------
+# NLTK bootstrap (quiet + cached)
+# -----------------------------
 def bootstrap_nltk():
     try:
         ssl._create_default_https_context = ssl._create_unverified_context
@@ -27,47 +35,56 @@ def bootstrap_nltk():
         except Exception:
             pass
 
-@st.cache_resource
-def load_spacy():
-    import spacy as _spacy
-    try:
-        return _spacy.load("en_core_web_sm")
-    except OSError:
-        from spacy.cli import download
-        download("en_core_web_sm")
-        return _spacy.load("en_core_web_sm")
-
-@st.cache_resource
-def load_model():
-    if not ST_OK:
-        return None
-    try:
-        return SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L6-v2")
-    except Exception:
-        return None
-
 bootstrap_nltk()
-NLP = load_spacy()
-SBERT = load_model()
+from nltk.tokenize import word_tokenize
+from nltk.corpus import wordnet
 
-def closest_synonym(word, candidates):
-    if not candidates:
-        return None
-    if SBERT is None or util is None:
-        return candidates[0]
-    w_emb = SBERT.encode(word, convert_to_tensor=True)
-    c_embs = SBERT.encode(candidates, convert_to_tensor=True)
-    scores = util.cos_sim(w_emb, c_embs)[0]
-    idx = scores.argmax().item()
-    return candidates[idx]
+# -----------------------------
+# Lightweight sentence splitter
+# -----------------------------
+def simple_split_sentences(text: str) -> List[str]:
+    # If spaCy is available with the en model, use it; else a regex fallback
+    try:
+        import spacy
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except Exception:
+            nlp = spacy.blank("en")
+            if "sentencizer" not in nlp.pipe_names:
+                nlp.add_pipe("sentencizer")
+        return [s.text.strip() for s in nlp(text).sents if s.text.strip()]
+    except Exception:
+        # Regex fallback
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        return [p.strip() for p in parts if p.strip()]
 
-# ---------- Humanizer ----------
+# -----------------------------
+# Humanizer core
+# -----------------------------
 class NewsHumanizer:
-    def __init__(self):
-        self.p_transition = 0.15
-        self.p_synonym = 0.25
+    """
+    Convert AI-ish / marketing-y text into neutral, readable news style:
+      - Tone down hype/emoji/excess punctuation
+      - Expand contractions (it's -> it is)
+      - Light synonyms (optionally guided by MiniLM)
+      - Optional neutral transitions for flow
+    """
+
+    def __init__(
+        self,
+        use_embeddings: bool = True,
+        p_synonym: float = 0.25,
+        p_transition: float = 0.15,
+        seed: Optional[int] = None,
+    ):
+        self.use_embeddings = use_embeddings and ST_OK
+        self.p_synonym = p_synonym
+        self.p_transition = p_transition
+        if seed is not None:
+            random.seed(seed)
+
         self.transitions = ["Meanwhile,", "In addition,", "Separately,", "Earlier,", "Later,"]
-        self.hype = {
+        self.hype_map = {
             r"\bgroundbreaking\b": "notable",
             r"\bgame[- ]?changer\b": "significant",
             r"\bspectacular\b": "major",
@@ -78,99 +95,174 @@ class NewsHumanizer:
             r"\bmassive\b": "large",
             r"\bthrilling\b": "energetic",
         }
-        self.expand = {"n't": " not", "'re": " are", "'s": " is", "'ll": " will",
-                       "'ve": " have", "'d": " would", "'m": " am"}
+        self.expand_map = {"n't":" not","'re":" are","'s":" is","'ll":" will","'ve":" have","'d":" would","'m":" am"}
 
-    def _expand_contractions(self, text):
-        tokens = word_tokenize(text)
+        # Lazy-load model on first use (saves memory on small dynos)
+        self._sbert = None
+
+    def _load_sbert(self):
+        if not self.use_embeddings or self._sbert is not None:
+            return
+        try:
+            self._sbert = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L6-v2")
+        except Exception:
+            self._sbert = None
+            self.use_embeddings = False  # fallback
+
+    def _closest_synonym(self, word: str, candidates: List[str]) -> Optional[str]:
+        if not candidates:
+            return None
+        if not self.use_embeddings or util is None:
+            return candidates[0]
+        self._load_sbert()
+        if self._sbert is None:
+            return candidates[0]
+        w = self._sbert.encode(word, convert_to_tensor=True)
+        c = self._sbert.encode(candidates, convert_to_tensor=True)
+        scores = util.cos_sim(w, c)[0]
+        idx = scores.argmax().item()
+        return candidates[idx]
+
+    @staticmethod
+    def _normalize_spaces(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _expand_contractions(self, s: str) -> str:
+        tokens = word_tokenize(s)
         out = []
         for tok in tokens:
             lw = tok.lower()
-            done = False
-            for c, e in self.expand.items():
+            replaced = False
+            for c, e in self.expand_map.items():
                 if lw.endswith(c):
-                    new = lw.replace(c, e)
-                    if tok[0].isupper():
-                        new = new.capitalize()
-                    out.append(new)
-                    done = True
+                    new_tok = lw.replace(c, e)
+                    if tok and tok[0].isupper():
+                        new_tok = new_tok.capitalize()
+                    out.append(new_tok)
+                    replaced = True
                     break
-            if not done:
+            if not replaced:
                 out.append(tok)
         return " ".join(out)
 
-    def _tone_down(self, s):
-        for pat, repl in self.hype.items():
+    def _tone_down(self, s: str) -> str:
+        # hype words, emojis, extra punctuation
+        for pat, repl in self.hype_map.items():
             s = re.sub(pat, repl, s, flags=re.IGNORECASE)
         s = re.sub(r"[🔥✨💥🚀🎉🤯👏]+", "", s)
         s = re.sub(r"(!){2,}", "!", s)
         s = re.sub(r"(\?){2,}", "?", s)
-        return re.sub(r"\s+", " ", s).strip()
+        return self._normalize_spaces(s)
 
-    def _simplify(self, s):
-        toks = word_tokenize(s)
-        pos = nltk.pos_tag(toks)
-        out = []
-        for w, p in pos:
-            if p[:1] in ("J","N","V","R") and wordnet.synsets(w):
-                if random.random() < self.p_synonym:
-                    cands = self._simple_synonyms(w, p)
-                    if cands:
-                        out.append(closest_synonym(w, cands) or w)
-                        continue
-            out.append(w)
-        return " ".join(out)
-
-    def _simple_synonyms(self, w, pos):
-        wn_pos = {"J":wordnet.ADJ, "N":wordnet.NOUN, "R":wordnet.ADV, "V":wordnet.VERB}.get(pos[0])
-        syns=set()
+    def _simple_synonyms(self, w: str, pos: str) -> List[str]:
+        wn_pos = {"J": wordnet.ADJ, "N": wordnet.NOUN, "R": wordnet.ADV, "V": wordnet.VERB}.get(pos[:1])
+        syns = set()
         for syn in wordnet.synsets(w, pos=wn_pos):
             for l in syn.lemmas():
-                name = l.name().replace("_"," ")
-                if len(name)<=12 and name.isalpha() and name.lower()!=w.lower():
+                name = l.name().replace("_", " ")
+                if len(name) <= 12 and name.isalpha() and name.lower() != w.lower():
                     syns.add(name)
         return list(syns)
 
-    def humanize(self, text):
-        doc = NLP(text)
+    def _simplify_with_synonyms(self, s: str) -> str:
+        tokens = word_tokenize(s)
+        pos_tags = nltk.pos_tag(tokens)
         out = []
-        for s in doc.sents:
-            t = s.text.strip()
-            t = self._tone_down(t)
+        for w, p in pos_tags:
+            if p[:1] in ("J", "N", "V", "R") and wordnet.synsets(w) and random.random() < self.p_synonym:
+                cands = self._simple_synonyms(w, p)
+                if cands:
+                    out.append(self._closest_synonym(w, cands) or w)
+                    continue
+            out.append(w)
+        return " ".join(out)
+
+    def _clean_punctuation_spacing(self, s: str) -> str:
+        s = re.sub(r"\s+([.,;:!?])", r"\1", s)
+        s = re.sub(r"([.,;:!?])([^\s])", r"\1 \2", s)
+        return s
+
+    def humanize(self, text: str) -> str:
+        sentences = simple_split_sentences(text)
+        out = []
+        for s in sentences:
+            t = self._tone_down(s)
             t = self._expand_contractions(t)
             if random.random() < self.p_transition:
                 t = f"{random.choice(self.transitions)} {t}"
-            t = self._simplify(t)
-            t = re.sub(r"\s+([.,;:!?])", r"\1", t)
-            t = re.sub(r"([.,;:!?])([^\s])", r"\1 \2", t)
+            t = self._simplify_with_synonyms(t)
+            t = self._clean_punctuation_spacing(t)
             out.append(t)
-        return re.sub(r"\s+", " ", " ".join(out)).strip()
+        return self._normalize_spaces(" ".join(out))
 
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="AI → Human News Converter", page_icon="📰", layout="wide")
-st.title("📰 AI → Human News Article Converter")
 
-st.markdown(
-    """
-Paste any AI-generated or marketing-style article below.  
-This tool rewrites it into a **neutral, professional news format** with natural language flow.
-""")
+# -----------------------------
+# FastAPI setup
+# -----------------------------
+app = FastAPI(title="News Humanizer API", version="1.0.0")
 
-text = st.text_area("✍️ Paste your AI text here", height=380, placeholder="Paste article text...")
+# Open CORS for dev; tighten origins in production
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # replace with your domain(s) in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-if st.button("✨ Convert to Human News Style"):
-    if not text.strip():
-        st.warning("Please enter some text.")
-    else:
-        with st.spinner("Converting... please wait..."):
-            humanizer = NewsHumanizer()
-            result = humanizer.humanize(text)
-        st.success("✅ Done!")
+HUMANIZER = NewsHumanizer(use_embeddings=True)
 
-        st.markdown("### 🧾 Original (AI Text)")
-        st.write(text)
+# -----------------------------
+# Schemas
+# -----------------------------
+class HumanizeRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    p_synonym: Optional[float] = Field(None, ge=0.0, le=1.0, description="0..1 probability of synonym substitution")
+    p_transition: Optional[float] = Field(None, ge=0.0, le=1.0, description="0..1 probability to insert a neutral transition")
+    seed: Optional[int] = Field(None, description="Random seed for deterministic output")
 
-        st.markdown("### 📰 Humanized News Article")
-        st.write(result)
+class HumanizeResponse(BaseModel):
+    humanized_text: str
 
-        st.download_button("⬇️ Download Output", result.encode("utf-8"), "news_output.txt", "text/plain")
+class HumanizeBatchRequest(BaseModel):
+    items: List[HumanizeRequest]
+
+class HumanizeBatchResponse(BaseModel):
+    results: List[HumanizeResponse]
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/version")
+def version():
+    return {"name": "News Humanizer API", "version": "1.0.0"}
+
+@app.post("/v1/humanize", response_model=HumanizeResponse)
+def humanize_endpoint(req: HumanizeRequest):
+    # allow per-request tuning
+    if req.p_synonym is not None:
+        HUMANIZER.p_synonym = req.p_synonym
+    if req.p_transition is not None:
+        HUMANIZER.p_transition = req.p_transition
+    if req.seed is not None:
+        random.seed(req.seed)
+
+    output = HUMANIZER.humanize(req.text)
+    return {"humanized_text": output}
+
+@app.post("/v1/humanize-batch", response_model=HumanizeBatchResponse)
+def humanize_batch_endpoint(req: HumanizeBatchRequest):
+    results = []
+    for item in req.items:
+        if item.p_synonym is not None:
+            HUMANIZER.p_synonym = item.p_synonym
+        if item.p_transition is not None:
+            HUMANIZER.p_transition = item.p_transition
+        if item.seed is not None:
+            random.seed(item.seed)
+        results.append(HumanizeResponse(humanized_text=HUMANIZER.humanize(item.text)))
+    return {"results": results}
